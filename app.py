@@ -1,27 +1,46 @@
+import os
 import streamlit as st
 import pandas as pd
+import matplotlib.pyplot as plt
 
 from generator import generate_bulk
 from preprocessing import (
     clean_text,
-    fit_tfidf,
     transform_tfidf,
-    fit_lstm_tokenizer,
     transform_lstm_sequences,
+    load_preprocessors
 )
 from detection import detect
 from analysis import analyze
-from utils import load_dataset
-from models.ml_model import train_all_models
-from models.lstm_model import build_model, train_model
-
+from models.ml_model import load_all_models
+from models.lstm_model import load_model_file
 
 st.set_page_config(page_title="AI Phishing Detection System", layout="wide")
 st.title("AI-Driven Phishing Email Generation and Detection Analysis Framework")
 
-# ---------------- Sidebar / Inputs ----------------
-st.subheader("Email Generation Settings")
 
+@st.cache_resource
+def load_inference_assets():
+    load_preprocessors()
+    load_all_models()
+    load_model_file()
+    return True
+
+
+def model_files_exist():
+    required_files = [
+        "saved_models/tfidf_vectorizer.pkl",
+        "saved_models/tokenizer.pkl",
+        "saved_models/logistic.pkl",
+        "saved_models/naive_bayes.pkl",
+        "saved_models/svm.pkl",
+        "saved_models/random_forest.pkl",
+        "saved_models/lstm_model.keras",
+    ]
+    return all(os.path.exists(f) for f in required_files)
+
+
+st.subheader("Email Generation Settings")
 prompt = st.text_area("Text Prompt", value="Generate realistic email samples")
 num = st.slider("Number of Emails", 1, 5, 3)
 email_type = st.selectbox("Email Type", ["phishing", "legitimate", "mixed"])
@@ -29,101 +48,59 @@ tone = st.selectbox("Tone", ["urgent", "formal", "friendly"])
 difficulty = st.selectbox("Difficulty", ["easy", "medium", "advanced"])
 target = st.text_input("Target", value="user")
 
-
-# ---------------- Session State ----------------
 if "emails" not in st.session_state:
     st.session_state["emails"] = []
 
-if "models_trained" not in st.session_state:
-    st.session_state["models_trained"] = False
-
-
-# ---------------- Generate Emails ----------------
 if st.button("Generate Emails"):
-    emails = generate_bulk(num, tone, target, difficulty, email_type)
-    st.session_state["emails"] = emails
-    st.success(f"{len(emails)} email(s) generated successfully.")
+    st.session_state["emails"] = generate_bulk(num, tone, target, difficulty, email_type)
+    st.success(f"{len(st.session_state['emails'])} email(s) generated successfully.")
 
-
-# ---------------- Display Generated Emails ----------------
 if st.session_state["emails"]:
     st.subheader("Generated Emails")
     for idx, e in enumerate(st.session_state["emails"], start=1):
         st.markdown(f"### Email {idx}")
-        st.text_area(
-            f"Generated Email {idx}",
-            e["email"],
-            height=250,
-            key=f"generated_email_{idx}"
-        )
+        st.text_area(f"Generated Email {idx}", e["email"], height=250, key=f"email_{idx}")
 
-
-# ---------------- Train Models ----------------
-def train_pipeline():
-    train_df = load_dataset()
-
-    # Optional: use smaller sample for faster experimentation
-    # Comment this out if you want full dataset training
-    train_df = train_df.sample(n=min(5000, len(train_df)), random_state=42)
-
-    train_df["text"] = train_df["text"].apply(clean_text)
-
-    X_train_tfidf = fit_tfidf(train_df["text"])
-    X_train_lstm = fit_lstm_tokenizer(train_df["text"])
-    y_train = train_df["label"]
-
-    train_all_models(X_train_tfidf, y_train)
-
-    build_model()
-    train_model(X_train_lstm, y_train)
-
-    st.session_state["models_trained"] = True
-
-
-# ---------------- Run Detection ----------------
 if st.button("Run Detection & Analysis"):
     if not st.session_state["emails"]:
         st.warning("Please generate emails first.")
-    else:
-        with st.spinner("Loading dataset and training models..."):
-            train_pipeline()
+        st.stop()
 
-        df = pd.DataFrame(st.session_state["emails"])
+    if not model_files_exist():
+        st.error("Saved models not found. Run train_and_save.py locally first.")
+        st.stop()
 
-        # Clean generated emails
-        df["clean_email"] = df["email"].apply(clean_text)
+    with st.spinner("Loading saved models and preprocessors..."):
+        load_inference_assets()
 
-        # Transform generated emails using trained preprocessors
-        X_test_tfidf = transform_tfidf(df["clean_email"])
-        X_test_lstm = transform_lstm_sequences(df["clean_email"])
+    df = pd.DataFrame(st.session_state["emails"])
+    df["clean_email"] = df["email"].apply(clean_text)
 
-        results = []
-        analysis_results = []
+    X_test_tfidf = transform_tfidf(df["clean_email"])
+    X_test_lstm = transform_lstm_sequences(df["clean_email"])
 
-        for i, row in df.iterrows():
-            res = detect(
-                row["email"],
-                X_test_tfidf[i],
-                X_test_lstm[i].reshape(1, -1)
-            )
+    results = []
+    analysis_results = []
 
-            ana = analyze(row["email"])
+    for i, row in df.iterrows():
+        res = detect(row["email"], X_test_tfidf[i], X_test_lstm[i].reshape(1, -1))
+        ana = analyze(row["email"])
 
-            ml_preds = res.get("ml_models", {})
+        ml_preds = res["ml_models"]
 
-            results.append({
-                "Email": row["email"][:80],
-                "Logistic Regression": ml_preds.get("logistic", "N/A"),
-                "Naive Bayes": ml_preds.get("naive_bayes", "N/A"),
-                "SVM": ml_preds.get("svm", "N/A"),
-                "Random Forest": ml_preds.get("random_forest", "N/A"),
-                "LSTM": res.get("lstm", "N/A"),
-                "BERT": res.get("bert", "N/A"),
-                "Final Decision": res.get("final", "N/A"),
-                "True Label": row.get("label", "N/A")
-            })
+        results.append({
+            "Email": row["email"][:80],
+            "Logistic Regression": ml_preds.get("logistic", "N/A"),
+            "Naive Bayes": ml_preds.get("naive_bayes", "N/A"),
+            "SVM": ml_preds.get("svm", "N/A"),
+            "Random Forest": ml_preds.get("random_forest", "N/A"),
+            "LSTM": res["lstm"],
+            "BERT": res["bert"],
+            "Final Decision": res["final"],
+            "True Label": row["label"]
+        })
 
-            analysis_results.append({
+        analysis_results.append({
             "Trigger Words": ", ".join(ana.get("triggers", [])),
             "Keywords": ", ".join(ana.get("keywords", [])),
             "Reason": ana.get("reason", ""),
@@ -133,13 +110,50 @@ if st.button("Run Detection & Analysis"):
             "Exclamation Count": ana.get("exclamation_count", 0),
             "Digit Count": ana.get("digit_count", 0),
             "URL-like Count": ana.get("url_like_count", 0)
-            })
-            
+        })
 
-        st.subheader("Detection Results")
-        results_df = pd.DataFrame(results)
-        st.dataframe(results_df, use_container_width=True)
+    results_df = pd.DataFrame(results)
+    analysis_df = pd.DataFrame(analysis_results)
 
-        st.subheader("Analysis Results")
-        analysis_df = pd.DataFrame(analysis_results)
-        st.dataframe(analysis_df, use_container_width=True)
+    st.subheader("Detection Results")
+    st.dataframe(results_df, use_container_width=True)
+
+    st.subheader("Analysis Results")
+    st.dataframe(analysis_df, use_container_width=True)
+
+    # Detection comparison chart
+    st.subheader("Detection Comparison")
+
+    model_columns = [
+        "Logistic Regression",
+        "Naive Bayes",
+        "SVM",
+        "Random Forest",
+        "LSTM",
+        "BERT",
+        "Final Decision"
+    ]
+
+    model_sums = results_df[model_columns].sum()
+
+    fig, ax = plt.subplots()
+    model_sums.plot(kind="bar", ax=ax)
+    ax.set_ylabel("Phishing Predictions")
+    ax.set_xlabel("Models")
+    ax.set_title("Model-wise Detection Comparison")
+    st.pyplot(fig)
+
+    # Bypass rate
+    phishing_df = results_df[results_df["True Label"] == 1]
+    if len(phishing_df) > 0:
+        bypass_count = (phishing_df["Final Decision"] == 0).sum()
+        bypass_rate = bypass_count / len(phishing_df)
+
+        st.subheader("Bypass Rate")
+        st.metric("Bypass Rate", f"{bypass_rate:.2%}")
+
+        fig2, ax2 = plt.subplots()
+        ax2.bar(["Detected", "Bypassed"], [len(phishing_df) - bypass_count, bypass_count])
+        ax2.set_title("Phishing Email Detection vs Bypass")
+        ax2.set_ylabel("Count")
+        st.pyplot(fig2)
